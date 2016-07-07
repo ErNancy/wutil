@@ -16,8 +16,9 @@ import (
 
 	"golang.org/x/net/context"
 
+	"goji.io/pattern"
+
 	"github.com/flosch/pongo2"
-	"goji.io/pat"
 )
 
 // TemplatesSuffix is the affixed suffix for template names.
@@ -217,7 +218,7 @@ func (a *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http
 
 // StaticHandler serves static assets from the AssetSet.
 func (a *AssetSet) StaticHandler(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
-	a.staticHandler(pat.Param(ctxt, "*")[1:], res, req)
+	a.staticHandler(pattern.Path(ctxt)[1:], res, req)
 }
 
 // FaviconHandler is a helper that serves the static "favicon.ico" asset from
