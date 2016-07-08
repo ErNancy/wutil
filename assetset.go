@@ -346,15 +346,16 @@ func (as *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*p
 
 	// load the path from the manifest and return if valid
 	name, ok := as.manifest[val]
-	if ok {
-		return pongo2.AsValue(as.assetPath + name), nil
+	if !ok {
+		// error if asset not in manifest
+		/*return nil, &pongo2.Error{
+			Sender:   "filter:asset",
+			ErrorMsg: fmt.Sprintf("asset '%s' not found in manifest", val),
+		}*/
+		return pongo2.AsValue("NA"), nil
 	}
 
-	// return error if asset not in manifest
-	return nil, &pongo2.Error{
-		Sender:   "filter:asset",
-		ErrorMsg: fmt.Sprintf("asset '%s' not found", val),
-	}
+	return pongo2.AsValue(as.assetPath + name), nil
 }
 
 // ExecuteTemplate executes a template from the asset with the passed context.
