@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,13 +17,15 @@ import (
 
 	"golang.org/x/net/context"
 
+	"goji.io"
+	"goji.io/pat"
 	"goji.io/pattern"
 
 	"github.com/flosch/pongo2"
 )
 
-// TemplatesSuffix is the affixed suffix for template names.
-var TemplatesSuffix string = ".html"
+// lgr is the common interface used for logging.
+type lgr func(string, ...interface{})
 
 type assetNameFn func() []string
 type assetFn func(string) ([]byte, error)
@@ -36,7 +39,13 @@ type AssetSet struct {
 	assetInfoFn assetInfoFn
 
 	// path for serving static assets
-	staticPath string
+	path string
+
+	// manifestPath is the name of the manifest file.
+	manifestPath string
+
+	// faviconPath is the path to the favicon.
+	faviconPath string
 
 	// manifest[name] (ie, the hashed path) -> info/data
 	staticManifest map[string]string
@@ -49,44 +58,124 @@ type AssetSet struct {
 	// templates path in asset data
 	templatesPath string
 
+	// templatesSuffix is the affixed suffix for template names.
+	templatesSuffix string
+
 	// templates
 	templates map[string]*pongo2.Template
+
+	// logger
+	logger lgr
+
+	// ignore
+	ignore []*regexp.Regexp
+}
+
+// AssetSetOption represents options when creating a new AssetSet.
+type AssetSetOption func(*AssetSet)
+
+// Path sets the root lookup path for the AssetSet.
+func Path(path string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.path = path
+	}
+}
+
+// TemplatesPath changes the default template path in the AssetSet.
+func TemplatesPath(path string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.templatesPath = path
+	}
+}
+
+// ManifestPath changes the default manifest path in the AssetSet.
+func ManifestPath(path string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.manifestPath = path
+	}
+}
+
+// FaviconPath changes the default favicon path in the AssetSet.
+func FaviconPath(path string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.faviconPath = path
+	}
+}
+
+// TemplatesSuffix changes the default template suffix in the AssetSet.
+func TemplatesSuffix(suffix string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.templatesSuffix = suffix
+	}
+}
+
+// Ignore prevents files matching the supplied regexps to be excluded from
+// being served from the AssetSet.
+func Ignore(regexps ...*regexp.Regexp) AssetSetOption {
+	return func(as *AssetSet) {
+		as.ignore = append(as.ignore, regexps...)
+	}
+}
+
+// Logger sets the logger for an AssetSet.
+func Logger(l lgr) AssetSetOption {
+	return func(as *AssetSet) {
+		as.logger = l
+	}
 }
 
 // NewAssetSet creates an asset set with the passed parameters.
-func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, staticPath, manifestPath, templatesPath string, ignore []*regexp.Regexp) *AssetSet {
-	a := AssetSet{
-		assetNameFn:   anFn,
-		assetFn:       aFn,
-		assetInfoFn:   aiFn,
-		staticPath:    staticPath,
-		templatesPath: templatesPath,
+/*staticPath, manifestPath, templatesPath string, ignore []*regexp.Regexp*/
+func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetSetOption) (*AssetSet, error) {
+	as := &AssetSet{
+		assetNameFn:     anFn,
+		assetFn:         aFn,
+		assetInfoFn:     aiFn,
+		path:            "/_/",
+		manifestPath:    "manifest.json",
+		templatesPath:   "templates/",
+		faviconPath:     "favicon.ico",
+		templatesSuffix: ".html",
+		logger:          log.Printf,
+		ignore:          []*regexp.Regexp{},
+	}
+
+	// apply options
+	for _, o := range opts {
+		o(as)
+	}
+
+	if !strings.HasSuffix(as.path, "/") {
+		return nil, errors.New("asset path must end with /")
+	}
+	if !strings.HasSuffix(as.templatesPath, "/") {
+		return nil, errors.New("templates path must end with /")
 	}
 
 	// grab manifest bytes
-	mfd, err := aFn(manifestPath)
+	mfd, err := aFn(as.manifestPath)
 	if err != nil {
-		panic(fmt.Errorf("could not read data from manifest '%s'", manifestPath))
+		return nil, fmt.Errorf("could not read data from manifest '%s'", as.manifestPath)
 	}
 
 	// load manifest data
 	var mf interface{}
 	err = json.Unmarshal(mfd, &mf)
 	if err != nil {
-		panic(fmt.Errorf("could not json.Unmarshal manifest '%s': %s", manifestPath, err))
+		return nil, fmt.Errorf("could not json.Unmarshal manifest '%s': %s", as.manifestPath, err)
 	}
 
 	// convert mf to actual map
 	manifestMap, ok := mf.(map[string]interface{})
 	if !ok {
-		panic(fmt.Errorf("'%s' is not a valid manifest", manifestPath))
+		return nil, fmt.Errorf("'%s' is not a valid manifest", as.manifestPath)
 	}
 
 	// create storage
-	a.staticManifest = make(map[string]string)
-	a.staticInfo = make(map[string]*os.FileInfo)
-	a.staticData = make(map[string]*[]byte)
-	a.staticHash = make(map[string]string)
+	as.staticManifest = make(map[string]string)
+	as.staticInfo = make(map[string]*os.FileInfo)
+	as.staticData = make(map[string]*[]byte)
+	as.staticHash = make(map[string]string)
 
 	// process static assets
 	ignoredCount := 0
@@ -94,7 +183,7 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, staticPath, ma
 		ignored := false
 
 		// determine if the name is in the ignore list
-		for _, re := range ignore {
+		for _, re := range as.ignore {
 			if re.MatchString(name) {
 				ignored = true
 				ignoredCount++
@@ -106,58 +195,56 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, staticPath, ma
 		if !ignored {
 			hash, ok := v.(string)
 			if !ok {
-				panic(fmt.Errorf("invalid value for key '%s' in manifest '%s'", name, manifestPath))
+				return nil, fmt.Errorf("invalid value for key '%s' in manifest '%s'", name, as.manifestPath)
 			}
 
 			data, err := aFn(hash)
 			if err != nil {
-				panic(fmt.Errorf("asset %s (%s) not available", name, hash))
+				return nil, fmt.Errorf("asset %s (%s) not available", name, hash)
 			}
 
 			info, err := aiFn(hash)
 			if err != nil {
-				panic(fmt.Errorf("asset info %s (%s) not available", name, hash))
+				return nil, fmt.Errorf("asset info %s (%s) not available", name, hash)
 			}
 
-			a.staticManifest[name] = hash
-			a.staticInfo[hash] = &info
-			a.staticData[hash] = &data
-			a.staticHash[hash] = fmt.Sprintf("%x", sha1.Sum(data))
-
-			//a.staticManifest[hash] = name
-			//a.staticInfo[name] = &info
-			//a.staticData[name] = &data
+			as.staticManifest[name] = hash
+			as.staticInfo[hash] = &info
+			as.staticData[hash] = &data
+			as.staticHash[hash] = fmt.Sprintf("%x", sha1.Sum(data))
 		}
 	}
 
 	// create template storage
-	a.templates = make(map[string]*pongo2.Template)
+	as.templates = make(map[string]*pongo2.Template)
 
 	// register asset filter
-	pongo2.RegisterFilter("asset", a.Pongo2AssetFilter)
+	pongo2.RegisterFilter("asset", as.Pongo2AssetFilter)
 
 	// setup template set
-	tplSet := pongo2.NewSet("", a)
+	tplSet := pongo2.NewSet("", as)
 
 	// loop over template assets and process
 	for _, name := range anFn() {
-		if strings.HasPrefix(name, a.templatesPath) && strings.HasSuffix(name, TemplatesSuffix) {
-			n := name[len(a.templatesPath):]
-			a.templates[n] = pongo2.Must(tplSet.FromFile(n))
+		if strings.HasPrefix(name, as.templatesPath) && strings.HasSuffix(name, as.templatesSuffix) {
+			n := name[len(as.templatesPath):]
+			as.templates[n] = pongo2.Must(tplSet.FromFile(n))
 		}
 	}
 
-	log.Printf("processed static assets (processed: %d, ignored: %d)", len(a.staticManifest), ignoredCount)
-	log.Printf("processed templates (%d)", len(a.templates))
+	as.logger("processed static assets (processed: %d, ignored: %d)", len(as.staticManifest), ignoredCount)
+	as.logger("processed templates (%d)", len(as.templates))
 
-	return &a
+	return as, nil
 }
 
-func (a *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http.Request) {
+// staticHandler retrieves the static asset from the AssetSet, sending it to
+// the http endpoint.
+func (as *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http.Request) {
 	// grab info
-	ai, ok := a.staticInfo[name]
+	ai, ok := as.staticInfo[name]
 	if !ok {
-		http.Error(res, http.StatusText(404), 404)
+		http.Error(res, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
@@ -170,9 +257,9 @@ func (a *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http
 	}
 
 	// grab hash
-	hash, ok := a.staticHash[name]
+	hash, ok := as.staticHash[name]
 	if !ok {
-		http.Error(res, http.StatusText(404), 404)
+		http.Error(res, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
@@ -183,9 +270,9 @@ func (a *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http
 	}
 
 	// grab data
-	data, ok := a.staticData[name]
+	data, ok := as.staticData[name]
 	if !ok {
-		http.Error(res, http.StatusText(404), 404)
+		http.Error(res, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
@@ -217,27 +304,27 @@ func (a *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http
 }
 
 // StaticHandler serves static assets from the AssetSet.
-func (a *AssetSet) StaticHandler(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
-	a.staticHandler(pattern.Path(ctxt)[1:], res, req)
+func (as *AssetSet) StaticHandler(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
+	as.staticHandler(pattern.Path(ctxt)[1:], res, req)
 }
 
 // FaviconHandler is a helper that serves the static "favicon.ico" asset from
 // the AssetSet.
-func (a *AssetSet) FaviconHandler(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
-	a.staticHandler("favicon.ico", res, req)
+func (as *AssetSet) FaviconHandler(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
+	as.staticHandler(as.faviconPath, res, req)
 }
 
 // -----------------------------------------------------------------------
 // Pongo2 methods
 
 // Abs see pongo2.TemplateLoader.Abs
-func (a AssetSet) Abs(base, name string) string {
+func (as AssetSet) Abs(base, name string) string {
 	return name
 }
 
 // Get see pongo2.TemplateLoader.Get
-func (a AssetSet) Get(path string) (io.Reader, error) {
-	data, err := a.assetFn(a.templatesPath + path)
+func (as AssetSet) Get(path string) (io.Reader, error) {
+	data, err := as.assetFn(as.templatesPath + path)
 	if err != nil {
 		return nil, err
 	}
@@ -247,14 +334,14 @@ func (a AssetSet) Get(path string) (io.Reader, error) {
 
 // Pongo2AssetFilter is a filter that can be used in pongo2 templates to change
 // the path of an asset.
-func (a *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
+func (as *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
 	// get value as string
 	val := in.String()
 
 	// load the path from the manifest and return if valid
-	name, ok := a.staticManifest[val]
+	name, ok := as.staticManifest[val]
 	if ok {
-		return pongo2.AsValue(a.staticPath + name), nil
+		return pongo2.AsValue(as.path + name), nil
 	}
 
 	// return error if asset not in manifest
@@ -265,9 +352,9 @@ func (a *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*po
 }
 
 // ExecuteTemplate executes a template from the asset with the passed context.
-func (a *AssetSet) ExecuteTemplate(res http.ResponseWriter, name string, context pongo2.Context) {
+func (as *AssetSet) ExecuteTemplate(res http.ResponseWriter, name string, context pongo2.Context) {
 	// load template
-	tpl, ok := a.templates[name]
+	tpl, ok := as.templates[name]
 	if !ok {
 		http.Error(res, fmt.Sprintf("cannot load template %s", name), http.StatusInternalServerError)
 		return
@@ -278,13 +365,26 @@ func (a *AssetSet) ExecuteTemplate(res http.ResponseWriter, name string, context
 }
 
 // TemplateHandler handles a template.
-func (a *AssetSet) TemplateHandler(tplName string, c ...pongo2.Context) func(context.Context, http.ResponseWriter, *http.Request) {
+func (as *AssetSet) TemplateHandler(tplName string, c ...pongo2.Context) func(context.Context, http.ResponseWriter, *http.Request) {
 	pongoContext := pongo2.Context{}
 	if len(c) > 0 {
 		pongoContext = c[0]
 	}
 
 	return func(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
-		a.ExecuteTemplate(res, tplName, pongoContext)
+		as.ExecuteTemplate(res, tplName, pongoContext)
 	}
+}
+
+// -----------------------------------------------------------------------
+
+// Register registers the AssetSet to the provided mux.
+func (as *AssetSet) Register(mux *goji.Mux) {
+	// add favicon handler only if the favicon.ico is present in the path.
+	if false {
+		mux.HandleFuncC(pat.Get("/favicon.ico"), as.FaviconHandler)
+	}
+
+	mux.HandleFuncC(pat.Get(as.path+"*"), as.StaticHandler)
+	//mux.HandleFuncC(pat.Get("/"), as.TemplateHandler("index.html"))
 }
