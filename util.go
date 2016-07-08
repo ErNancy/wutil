@@ -4,9 +4,10 @@ import (
 	"net/http"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"goji.io"
 	"goji.io/pat"
-	"golang.org/x/net/context"
 )
 
 // OkHandler simply replies with a "200 OK" response (useful for load balancers

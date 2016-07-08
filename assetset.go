@@ -31,6 +31,13 @@ type assetNameFn func() []string
 type assetFn func(string) ([]byte, error)
 type assetInfoFn func(string) (os.FileInfo, error)
 
+type asset struct {
+	info        *os.FileInfo
+	data        *[]byte
+	sha1        string
+	contentType string
+}
+
 // AssetSet is a collection of static assets.
 type AssetSet struct {
 	// retrieval functions
@@ -38,8 +45,8 @@ type AssetSet struct {
 	assetFn     assetFn
 	assetInfoFn assetInfoFn
 
-	// path for serving static assets
-	path string
+	// assetPath is the location of the bin'd assets.
+	assetPath string
 
 	// manifestPath is the name of the manifest file.
 	manifestPath string
@@ -47,13 +54,11 @@ type AssetSet struct {
 	// faviconPath is the path to the favicon.
 	faviconPath string
 
-	// manifest[name] (ie, the hashed path) -> info/data
-	staticManifest map[string]string
+	// manifest is the map of the name of hashed paths -> original path
+	manifest map[string]string
 
-	// processed static asset info/data
-	staticInfo map[string]*os.FileInfo
-	staticData map[string]*[]byte
-	staticHash map[string]string
+	// processed asset data
+	assets map[string]*asset
 
 	// templates path in asset data
 	templatesPath string
@@ -77,7 +82,7 @@ type AssetSetOption func(*AssetSet)
 // Path sets the root lookup path for the AssetSet.
 func Path(path string) AssetSetOption {
 	return func(as *AssetSet) {
-		as.path = path
+		as.assetPath = path
 	}
 }
 
@@ -125,19 +130,24 @@ func Logger(l lgr) AssetSetOption {
 }
 
 // NewAssetSet creates an asset set with the passed parameters.
-/*staticPath, manifestPath, templatesPath string, ignore []*regexp.Regexp*/
+/*assetPath, manifestPath, templatesPath string, ignore []*regexp.Regexp*/
 func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetSetOption) (*AssetSet, error) {
 	as := &AssetSet{
-		assetNameFn:     anFn,
-		assetFn:         aFn,
-		assetInfoFn:     aiFn,
-		path:            "/_/",
+		assetNameFn: anFn,
+		assetFn:     aFn,
+		assetInfoFn: aiFn,
+
+		assetPath:       "/_/",
 		manifestPath:    "manifest.json",
 		templatesPath:   "templates/",
 		faviconPath:     "favicon.ico",
 		templatesSuffix: ".html",
-		logger:          log.Printf,
-		ignore:          []*regexp.Regexp{},
+
+		logger: log.Printf,
+		ignore: []*regexp.Regexp{},
+
+		manifest: make(map[string]string),
+		assets:   make(map[string]*asset),
 	}
 
 	// apply options
@@ -145,7 +155,7 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetS
 		o(as)
 	}
 
-	if !strings.HasSuffix(as.path, "/") {
+	if !strings.HasSuffix(as.assetPath, "/") {
 		return nil, errors.New("asset path must end with /")
 	}
 	if !strings.HasSuffix(as.templatesPath, "/") {
@@ -170,12 +180,6 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetS
 	if !ok {
 		return nil, fmt.Errorf("'%s' is not a valid manifest", as.manifestPath)
 	}
-
-	// create storage
-	as.staticManifest = make(map[string]string)
-	as.staticInfo = make(map[string]*os.FileInfo)
-	as.staticData = make(map[string]*[]byte)
-	as.staticHash = make(map[string]string)
 
 	// process static assets
 	ignoredCount := 0
@@ -208,10 +212,14 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetS
 				return nil, fmt.Errorf("asset info %s (%s) not available", name, hash)
 			}
 
-			as.staticManifest[name] = hash
-			as.staticInfo[hash] = &info
-			as.staticData[hash] = &data
-			as.staticHash[hash] = fmt.Sprintf("%x", sha1.Sum(data))
+			// store data
+			as.manifest[name] = hash
+			as.assets[hash] = &asset{
+				info:        &info,
+				data:        &data,
+				sha1:        fmt.Sprintf("%x", sha1.Sum(data)),
+				contentType: as.contentType(name),
+			}
 		}
 	}
 
@@ -232,7 +240,13 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetS
 		}
 	}
 
-	as.logger("processed static assets (processed: %d, ignored: %d)", len(as.staticManifest), ignoredCount)
+	// format ignored
+	ignoredStr := ""
+	if ignoredCount > 0 {
+		ignoredStr = fmt.Sprintf(", ignored: %d", ignoredCount)
+	}
+
+	as.logger("processed static assets (%d%s)", len(as.manifest), ignoredStr)
 	as.logger("processed templates (%d)", len(as.templates))
 
 	return as, nil
@@ -242,13 +256,14 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetS
 // the http endpoint.
 func (as *AssetSet) staticHandler(name string, res http.ResponseWriter, req *http.Request) {
 	// grab info
-	ai, ok := as.staticInfo[name]
+	assetItem, ok := as.assets[name]
 	if !ok {
 		http.Error(res, http.StatusText(http.StatusNotFound), http.StatusNotFound)
 		return
 	}
 
-	modtime := (*ai).ModTime()
+	// grab modtime
+	modtime := (*assetItem.info).ModTime()
 
 	// check if-modified-since header, bail if present
 	if t, err := time.Parse(http.TimeFormat, req.Header.Get("If-Modified-Since")); err == nil && modtime.Unix() <= t.Unix() {
@@ -256,51 +271,42 @@ func (as *AssetSet) staticHandler(name string, res http.ResponseWriter, req *htt
 		return
 	}
 
-	// grab hash
-	hash, ok := as.staticHash[name]
-	if !ok {
-		http.Error(res, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-		return
-	}
-
-	// check If-None-Match header, bail if present and match to hash
-	if req.Header.Get("If-None-Match") == hash {
+	// check If-None-Match header, bail if present and match sha1
+	if req.Header.Get("If-None-Match") == assetItem.sha1 {
 		res.WriteHeader(http.StatusNotModified) // 304
 		return
 	}
 
-	// grab data
-	data, ok := as.staticData[name]
-	if !ok {
-		http.Error(res, http.StatusText(http.StatusNotFound), http.StatusNotFound)
-		return
-	}
-
-	// determine content type
-	typ := "application/octet-stream"
-	pos := strings.LastIndex(name, ".")
-	if pos >= 0 {
-		ext := name[pos:]
-		if ext == ".ico" {
-			// force content type for .ico
-			typ = "image/x-icon"
-		} else {
-			typ = mime.TypeByExtension(ext)
-		}
-	}
-
 	// set headers
-	res.Header().Set("Content-Type", typ)
+	res.Header().Set("Content-Type", assetItem.contentType)
 	res.Header().Set("Date", time.Now().Format(http.TimeFormat))
 
 	// cache headers
 	res.Header().Set("Cache-Control", "public, no-transform, max-age=31536000")
 	res.Header().Set("Expires", time.Now().AddDate(1, 0, 0).Format(http.TimeFormat))
 	res.Header().Set("Last-Modified", modtime.Format(http.TimeFormat))
-	res.Header().Set("ETag", hash)
+	res.Header().Set("ETag", assetItem.sha1)
 
 	// write data to response
-	res.Write(*data)
+	res.Write(*(assetItem.data))
+}
+
+// contentType returns the content type based on a file's name.
+func (as *AssetSet) contentType(name string) string {
+	// determine content type
+	typ := "application/octet-stream"
+	pos := strings.LastIndex(name, ".")
+	if pos >= 0 {
+		ext := name[pos:]
+		if ext == ".ico" {
+			// force for .ico
+			typ = "image/x-icon"
+		} else {
+			typ = mime.TypeByExtension(ext)
+		}
+	}
+
+	return typ
 }
 
 // StaticHandler serves static assets from the AssetSet.
@@ -339,9 +345,9 @@ func (as *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*p
 	val := in.String()
 
 	// load the path from the manifest and return if valid
-	name, ok := as.staticManifest[val]
+	name, ok := as.manifest[val]
 	if ok {
-		return pongo2.AsValue(as.path + name), nil
+		return pongo2.AsValue(as.assetPath + name), nil
 	}
 
 	// return error if asset not in manifest
@@ -385,6 +391,5 @@ func (as *AssetSet) Register(mux *goji.Mux) {
 		mux.HandleFuncC(pat.Get("/favicon.ico"), as.FaviconHandler)
 	}
 
-	mux.HandleFuncC(pat.Get(as.path+"*"), as.StaticHandler)
-	//mux.HandleFuncC(pat.Get("/"), as.TemplateHandler("index.html"))
+	mux.HandleFuncC(pat.Get(as.assetPath+"*"), as.StaticHandler)
 }
