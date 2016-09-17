@@ -24,6 +24,32 @@ import (
 	"github.com/flosch/pongo2"
 )
 
+const (
+	// DefaultAssetFilterName is the dafault asset filter name used in asset
+	// sets.
+	DefaultAssetFilterName = "asset"
+
+	// DefaultCsrfVariableName is the default csrf variable name used in asset
+	// sets.
+	DefaultCsrfVariableName = "__csrf_token__"
+
+	// DefaultAssetPath is the default asset path prefix for static assets.
+	DefaultAssetPath = "/_/"
+
+	// DefaultManifestPath is the path to the manifest in the asset set to use
+	// to determine what assets to serve.
+	DefaultManifestPath = "manifest.json"
+
+	// DefaultTemplatesPath is the path to templates in the asset set.
+	DefaultTemplatesPath = "templates/"
+
+	// DefaultFaviconPath is the path to the favicon.
+	DefaultFaviconPath = "favicon.ico"
+
+	// DefaultTemplatesSuffix is the default suffix to use for templates.
+	DefaultTemplatesSuffix = ".html"
+)
+
 // lgr is the common interface used for logging.
 type lgr func(string, ...interface{})
 
@@ -44,6 +70,16 @@ type AssetSet struct {
 	assetNameFn assetNameFn
 	assetFn     assetFn
 	assetInfoFn assetInfoFn
+
+	// assetFilterName is the name used in templates for the asset filter.
+	assetFilterName string
+
+	// csrfVariableName is the name to add to the template context for the
+	// generate csrf token.
+	csrfVariableName string
+
+	// csrf is a func that returns the csrf token for the request.
+	csrf func(context.Context, *http.Request) string
 
 	// assetPath is the location of the bin'd assets.
 	assetPath string
@@ -129,19 +165,47 @@ func Logger(l lgr) AssetSetOption {
 	}
 }
 
+// AssetFilterName sets the asset filter name used in the AssetSet.
+func AssetFilterName(name string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.assetFilterName = name
+	}
+}
+
+// CsrfVariableName sets the csrf variable name used in the AssetSet.
+func CsrfVariableName(name string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.csrfVariableName = name
+	}
+}
+
+// Csrf sets the func that generates a csrf token from the context for an
+// AssetSet.
+//
+// Templates will have this value available to them via as {{ csrf }}.
+func Csrf(f func(context.Context, *http.Request) string) AssetSetOption {
+	return func(as *AssetSet) {
+		as.csrf = f
+	}
+}
+
 // NewAssetSet creates an asset set with the passed parameters.
-/*assetPath, manifestPath, templatesPath string, ignore []*regexp.Regexp*/
 func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetSetOption) (*AssetSet, error) {
 	as := &AssetSet{
 		assetNameFn: anFn,
 		assetFn:     aFn,
 		assetInfoFn: aiFn,
 
-		assetPath:       "/_/",
-		manifestPath:    "manifest.json",
-		templatesPath:   "templates/",
-		faviconPath:     "favicon.ico",
-		templatesSuffix: ".html",
+		assetFilterName:  DefaultAssetFilterName,
+		csrfVariableName: DefaultCsrfVariableName,
+
+		csrf: nil,
+
+		assetPath:       DefaultAssetPath,
+		manifestPath:    DefaultManifestPath,
+		templatesPath:   DefaultTemplatesPath,
+		faviconPath:     DefaultFaviconPath,
+		templatesSuffix: DefaultTemplatesSuffix,
 
 		logger: log.Printf,
 		ignore: []*regexp.Regexp{},
@@ -227,7 +291,7 @@ func NewAssetSet(anFn assetNameFn, aFn assetFn, aiFn assetInfoFn, opts ...AssetS
 	as.templates = make(map[string]*pongo2.Template)
 
 	// register asset filter
-	pongo2.RegisterFilter("asset", as.Pongo2AssetFilter)
+	pongo2.RegisterFilter(as.assetFilterName, as.Pongo2AssetFilter)
 
 	// setup template set
 	tplSet := pongo2.NewSet("", as)
@@ -297,13 +361,7 @@ func (as *AssetSet) contentType(name string) string {
 	typ := "application/octet-stream"
 	pos := strings.LastIndex(name, ".")
 	if pos >= 0 {
-		ext := name[pos:]
-		if ext == ".ico" {
-			// force for .ico
-			typ = "image/x-icon"
-		} else {
-			typ = mime.TypeByExtension(ext)
-		}
+		typ = mime.TypeByExtension(name[pos:])
 	}
 
 	return typ
@@ -347,11 +405,8 @@ func (as *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*p
 	// load the path from the manifest and return if valid
 	name, ok := as.manifest[val]
 	if !ok {
-		// error if asset not in manifest
-		/*return nil, &pongo2.Error{
-			Sender:   "filter:asset",
-			ErrorMsg: fmt.Sprintf("asset '%s' not found in manifest", val),
-		}*/
+		// asset not in manifest
+		as.logger("asset %s not found in manifest", val)
 		return pongo2.AsValue("NA"), nil
 	}
 
@@ -372,19 +427,24 @@ func (as *AssetSet) ExecuteTemplate(res http.ResponseWriter, name string, contex
 }
 
 // TemplateHandler handles a template.
-func (as *AssetSet) TemplateHandler(tplName string, c ...pongo2.Context) func(context.Context, http.ResponseWriter, *http.Request) {
-	pongoContext := pongo2.Context{}
-	if len(c) > 0 {
-		pongoContext = c[0]
+func (as *AssetSet) TemplateHandler(tplName string, ctxts ...pongo2.Context) func(context.Context, http.ResponseWriter, *http.Request) {
+	// create final context for the handler
+	final := pongo2.Context{}
+	for _, ctxt := range ctxts {
+		for k, v := range ctxt {
+			final[k] = v
+		}
 	}
 
 	return func(ctxt context.Context, res http.ResponseWriter, req *http.Request) {
-		as.ExecuteTemplate(res, tplName, pongoContext)
+		if as.csrf != nil {
+			final[as.csrfVariableName] = as.csrf(ctxt, req)
+		}
+		as.ExecuteTemplate(res, tplName, final)
 	}
 }
 
 // -----------------------------------------------------------------------
-
 // Register registers the AssetSet to the provided mux.
 func (as *AssetSet) Register(mux *goji.Mux) {
 	// add favicon handler only if the favicon.ico is present in the path.
@@ -393,4 +453,8 @@ func (as *AssetSet) Register(mux *goji.Mux) {
 	}
 
 	mux.HandleFuncC(pat.Get(as.assetPath+"*"), as.StaticHandler)
+}
+
+func init() {
+	mime.AddExtensionType("ico", "image/x-icon")
 }
