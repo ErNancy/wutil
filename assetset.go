@@ -414,16 +414,15 @@ func (as *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*p
 }
 
 // ExecuteTemplate executes a template from the asset with the passed context.
-func (as *AssetSet) ExecuteTemplate(res http.ResponseWriter, name string, context pongo2.Context) {
+func (as *AssetSet) ExecuteTemplate(w io.Writer, name string, ctxt pongo2.Context) error {
 	// load template
 	tpl, ok := as.templates[name]
 	if !ok {
-		http.Error(res, fmt.Sprintf("cannot load template %s", name), http.StatusInternalServerError)
-		return
+		return fmt.Errorf("cannot load template %s", name)
 	}
 
 	// execute
-	tpl.ExecuteWriterUnbuffered(context, res)
+	return tpl.ExecuteWriterUnbuffered(ctxt, w)
 }
 
 // TemplateHandler handles a template.
@@ -440,7 +439,11 @@ func (as *AssetSet) TemplateHandler(tplName string, ctxts ...pongo2.Context) fun
 		if as.csrf != nil {
 			final[as.csrfVariableName] = as.csrf(ctxt, req)
 		}
-		as.ExecuteTemplate(res, tplName, final)
+
+		err := as.ExecuteTemplate(res, tplName, final)
+		if err != nil {
+			http.Error(res, err.Error(), http.StatusInternalServerError)
+		}
 	}
 }
 
