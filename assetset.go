@@ -84,13 +84,13 @@ type AssetSet struct {
 	// assetPath is the location of the bin'd assets.
 	assetPath string
 
-	// manifestPath is the name of the manifest file.
+	// manifestPath is the path of the manifest file in the asset set.
 	manifestPath string
 
-	// faviconPath is the path to the favicon.
+	// faviconPath is the path to the favicon in the asset set.
 	faviconPath string
 
-	// manifest is the map of the name of hashed paths -> original path
+	// manifest is the map of the original asset name -> hashed.
 	manifest map[string]string
 
 	// processed asset data
@@ -378,6 +378,20 @@ func (as *AssetSet) FaviconHandler(ctxt context.Context, res http.ResponseWriter
 	as.staticHandler(as.faviconPath, res, req)
 }
 
+// AssetPath retrieves the asset's manifest path and returns the path prefix
+// along with the path hash.
+func (as *AssetSet) AssetPath(path string) string {
+	// load the path from the manifest and return if valid
+	p, ok := as.manifest[path]
+	if !ok {
+		// asset not in manifest
+		as.logger("asset %s not found in manifest", path)
+		return "NA"
+	}
+
+	return as.assetPath + p
+}
+
 // -----------------------------------------------------------------------
 // Pongo2 methods
 
@@ -396,21 +410,10 @@ func (as AssetSet) Get(path string) (io.Reader, error) {
 	return bytes.NewReader(data), nil
 }
 
-// Pongo2AssetFilter is a filter that can be used in pongo2 templates to change
-// the path of an asset.
+// Pongo2AssetFilter is a filter that can be used in pongo2 templates to return
+// the asset path.
 func (as *AssetSet) Pongo2AssetFilter(in *pongo2.Value, param *pongo2.Value) (*pongo2.Value, *pongo2.Error) {
-	// get value as string
-	val := in.String()
-
-	// load the path from the manifest and return if valid
-	name, ok := as.manifest[val]
-	if !ok {
-		// asset not in manifest
-		as.logger("asset %s not found in manifest", val)
-		return pongo2.AsValue("NA"), nil
-	}
-
-	return pongo2.AsValue(as.assetPath + name), nil
+	return pongo2.AsSafeValue(as.AssetPath(in.String())), nil
 }
 
 // ExecuteTemplate executes a template from the asset with the passed context.
